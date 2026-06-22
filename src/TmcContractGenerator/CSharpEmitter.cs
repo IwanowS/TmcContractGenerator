@@ -25,7 +25,7 @@ internal sealed class CSharpEmitter
         _model = model;
         _config = config;
         _tmcName = tmcName;
-        _rootClass = "Plc" + Identifier(Path.GetFileNameWithoutExtension(tmcName));
+        _rootClass = "PlcRoot_" + Identifier(Path.GetFileNameWithoutExtension(tmcName));
     }
 
     public List<string> Warnings { get; } = new();
