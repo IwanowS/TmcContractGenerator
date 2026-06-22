@@ -44,7 +44,7 @@ public sealed class GeneratorException : Exception
     public GeneratorException(string message, Exception inner) : base(message, inner) { }
 }
 
-internal enum PlcTypeKind { Primitive, Enum, Struct, Array, String, Unknown }
+internal enum PlcTypeKind { Primitive, Enum, Struct, Array, String, Namespace, Unknown }
 
 internal sealed class PlcArrayDimension
 {
@@ -77,6 +77,7 @@ internal sealed class PlcType
     public TypeReference BaseType { get; init; } = new();
     public List<PlcField> Fields { get; init; } = new();
     public List<PlcEnumValue> EnumValues { get; init; } = new();
+    public bool IsSyntheticNamespace { get; init; }
 }
 
 internal sealed class TypeReference

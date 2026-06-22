@@ -46,6 +46,22 @@ public sealed class GeneratorTests
     }
 
     [TestMethod]
+    public void NamespaceRootCreatesSyntheticParentNode()
+    {
+        var result = ContractGenerator.Generate(WriteConfig(new[] { "GVL_HMI" }));
+        Assert.AreEqual("GVL_HMI", result.Roots.Single());
+        var wrappers = Read("Generated/PlcMachinePlc.g.cs");
+        StringAssert.Contains(wrappers, "public TmcNamespace");
+        StringAssert.Contains(wrappers, " GvlHmi { get; private set; }");
+        StringAssert.Contains(wrappers, " HMI { get; private set; }");
+        var manifest = Read("Generated/PlcMachinePlc.Manifest.g.cs");
+        StringAssert.Contains(manifest, "Path = \"GVL_HMI\"");
+        StringAssert.Contains(manifest, "Kind = \"namespace\"");
+        StringAssert.Contains(manifest, "Path = \"GVL_HMI.HMI.State.is-ready\"");
+        StringAssert.Contains(manifest, "Path = \"GVL_HMI.Counter\"");
+    }
+
+    [TestMethod]
     public void GenerationIsByteStableAndDoesNotTouchUnchangedFiles()
     {
         var config = WriteConfig(new[] { "GVL_HMI.HMI" });
@@ -65,7 +81,7 @@ public sealed class GeneratorTests
     public void MissingRootFails()
     {
         var exception = Assert.ThrowsException<GeneratorException>(() => ContractGenerator.Generate(WriteConfig(new[] { "Missing.Root" })));
-        StringAssert.Contains(exception.Message, "Configured root symbol not found");
+        StringAssert.Contains(exception.Message, "Configured root symbol or namespace not found");
     }
 
     [TestMethod]

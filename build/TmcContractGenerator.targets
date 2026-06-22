@@ -1,6 +1,6 @@
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
-    <TmcContractGeneratedRoot Condition="'$(TmcContractGeneratedRoot)' == ''">$(MSBuildProjectDirectory)\Generated</TmcContractGeneratedRoot>
+    <TmcContractGeneratedRoot Condition="'$(TmcContractGeneratedRoot)' == ''">Generated</TmcContractGeneratedRoot>
     <TmcContractPowerShell Condition="'$(TmcContractPowerShell)' == ''">powershell.exe</TmcContractPowerShell>
   </PropertyGroup>
 

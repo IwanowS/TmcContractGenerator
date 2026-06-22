@@ -32,7 +32,7 @@ public static class ContractGenerator
         Directory.CreateDirectory(outputPath);
         EnsureOutputOwnership(outputPath, Path.GetFileName(tmcPath));
         var model = TmcParser.Parse(tmcPath);
-        var roots = SelectRoots(model.Symbols, config.Roots ?? Array.Empty<string>());
+        var roots = SelectRoots(model, config.Roots ?? Array.Empty<string>());
         var emitter = new CSharpEmitter(model, config, Path.GetFileName(tmcPath));
         var output = emitter.Emit(roots);
         if (config.UnknownTypeIsError && emitter.Warnings.Any(x => x.StartsWith("Unknown PLC type", StringComparison.Ordinal)))
@@ -56,18 +56,85 @@ public static class ContractGenerator
         };
     }
 
-    private static List<PlcSymbol> SelectRoots(List<PlcSymbol> symbols, string[] configured)
+    private static List<PlcSymbol> SelectRoots(TmcModel model, string[] configured)
     {
+        var symbols = model.Symbols;
         if (configured.Length > 0)
         {
             var selected = new List<PlcSymbol>();
             foreach (var root in configured)
-                selected.Add(symbols.FirstOrDefault(x => string.Equals(x.Path, root, StringComparison.Ordinal))
-                    ?? throw new GeneratorException("Configured root symbol not found: " + root));
+            {
+                var exact = symbols.FirstOrDefault(x => string.Equals(x.Path, root, StringComparison.Ordinal));
+                if (exact != null)
+                {
+                    selected.Add(exact);
+                    continue;
+                }
+
+                var descendants = symbols.Where(x => x.Path.StartsWith(root + ".", StringComparison.Ordinal)).ToList();
+                if (descendants.Count == 0)
+                    throw new GeneratorException("Configured root symbol or namespace not found: " + root);
+                selected.Add(CreateNamespaceRoot(model, root, descendants));
+            }
             return selected;
         }
         return symbols.Where(symbol => !symbols.Any(other => !ReferenceEquals(symbol, other) && symbol.Path.StartsWith(other.Path + ".", StringComparison.Ordinal)))
             .OrderBy(x => x.Path, StringComparer.Ordinal).ToList();
+    }
+
+    private static PlcSymbol CreateNamespaceRoot(TmcModel model, string path, List<PlcSymbol> descendants)
+    {
+        var type = CreateNamespaceType(model, path, descendants);
+        return new PlcSymbol
+        {
+            Path = path,
+            Type = new TypeReference { Name = type.QualifiedName },
+            BitSize = null,
+            Comment = "Synthetic node generated from TwinCAT symbol namespace."
+        };
+    }
+
+    private static PlcType CreateNamespaceType(TmcModel model, string path, List<PlcSymbol> descendants)
+    {
+        var typeName = "__TmcNamespace_" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(path))).Substring(0, 12);
+        if (model.TypesByName.TryGetValue(typeName, out var existing)) return existing;
+
+        var type = new PlcType { Name = typeName, QualifiedName = typeName, IsSyntheticNamespace = true };
+        model.TypesByName[typeName] = type;
+        var prefixLength = path.Length + 1;
+        foreach (var group in descendants.GroupBy(x => FirstPathSegment(x.Path.Substring(prefixLength)), StringComparer.Ordinal)
+                     .OrderBy(x => x.Key, StringComparer.Ordinal))
+        {
+            var childPath = path + "." + group.Key;
+            var exact = group.FirstOrDefault(x => string.Equals(x.Path, childPath, StringComparison.Ordinal));
+            if (exact != null)
+            {
+                type.Fields.Add(new PlcField
+                {
+                    Name = group.Key,
+                    Type = exact.Type,
+                    BitSize = exact.BitSize,
+                    Comment = exact.Comment,
+                    Dimensions = exact.Dimensions
+                });
+                continue;
+            }
+
+            var nested = CreateNamespaceType(model, childPath, group.ToList());
+            type.Fields.Add(new PlcField
+            {
+                Name = group.Key,
+                Type = new TypeReference { Name = nested.QualifiedName },
+                Comment = "Synthetic node generated from TwinCAT symbol namespace."
+            });
+        }
+        return type;
+    }
+
+    private static string FirstPathSegment(string relativePath)
+    {
+        var separator = relativePath.IndexOf('.');
+        return separator < 0 ? relativePath : relativePath.Substring(0, separator);
     }
 
     private static string Resolve(string directory, string path) => Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(directory, path));

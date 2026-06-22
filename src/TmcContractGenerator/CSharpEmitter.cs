@@ -54,7 +54,7 @@ internal sealed class CSharpEmitter
             Size = bits.HasValue && bits.Value % 8 == 0 ? bits.Value / 8 : null, Comment = comment,
             BinaryLayoutReliable = reliable, Dimensions = dimensions, Type = reference
         });
-        if (kind != PlcTypeKind.Struct || type == null || !stack.Add(type.QualifiedName)) return;
+        if ((kind != PlcTypeKind.Struct && kind != PlcTypeKind.Namespace) || type == null || !stack.Add(type.QualifiedName)) return;
         foreach (var field in type.Fields)
             Flatten(path + "." + field.Name, field.Type, field.BitSize, field.Comment, field.Dimensions, stack);
         stack.Remove(type.QualifiedName);
@@ -244,6 +244,7 @@ internal sealed class CSharpEmitter
     {
         if (dimensions.Count > 0) return PlcTypeKind.Array;
         if (reference.PointerLevel > 0) return Unknown(reference);
+        if (type?.IsSyntheticNamespace == true) return PlcTypeKind.Namespace;
         if (IsString(reference.Name) || (type != null && IsString(type.BaseType.Name))) return PlcTypeKind.String;
         if (type?.EnumValues.Count > 0) return PlcTypeKind.Enum;
         if (type?.Fields.Count > 0) return PlcTypeKind.Struct;
