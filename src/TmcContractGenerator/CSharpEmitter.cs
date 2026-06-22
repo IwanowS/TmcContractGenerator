@@ -67,17 +67,22 @@ internal sealed class CSharpEmitter
         EmitSymbolHelpers(sb);
         var reachable = ReachableTypes(roots.Select(x => x.Type));
         foreach (var type in reachable.Where(x => x.Fields.Count > 0).OrderBy(x => x.QualifiedName, StringComparer.Ordinal)) EmitNode(sb, type);
-
         sb.Append("    public sealed partial class ").Append(_rootClass).Append("\n    {\n")
-          .Append("        private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;\n\n")
+          .Append("        private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;\n")
+          .Append("        private readonly ETS.TwinCAT.Ads.PlcConnection _connection;\n\n")
           .Append("        public ").Append(_rootClass).Append("(ETS.TwinCAT.Interfaces.IVariablesProvider variables)\n        {\n")
-          .Append("            if (variables == null) throw new System.ArgumentNullException(\"variables\");\n            _variables = variables;\n");
+          .Append("            if (variables == null) throw new System.ArgumentNullException(\"variables\");\n")
+          .Append("            _variables = variables;\n            Initialize();\n        }\n\n")
+          .Append("        public ").Append(_rootClass).Append("(ETS.TwinCAT.Ads.PlcConnection connection)\n        {\n")
+          .Append("            if (connection == null) throw new System.ArgumentNullException(\"connection\");\n")
+          .Append("            _connection = connection;\n            _variables = connection.VariablesProvider;\n            Initialize();\n        }\n\n")
+          .Append("        private void Initialize()\n        {\n");
         var rootNames = UniqueMemberNames(roots.Select(x => x.Path.Split('.').Last()).ToList());
         for (var i = 0; i < roots.Count; i++)
         {
             var root = roots[i];
             sb.Append("            ").Append(rootNames[i]).Append(" = new ").Append(WrapperType(root.Type, root.Dimensions))
-              .Append("(_variables, \"").Append(Escape(root.Path)).Append('"');
+              .Append("(_variables, _connection, \"").Append(Escape(root.Path)).Append('"');
             AppendDimensions(sb, root.Dimensions);
             sb.Append(");\n");
         }
@@ -92,25 +97,44 @@ internal sealed class CSharpEmitter
 
     private void EmitSymbolHelpers(StringBuilder sb)
     {
-        sb.Append("    public sealed class PlcSymbol<T>\n    {\n")
-          .Append("        private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;\n")
-          .Append("        public PlcSymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, string path) { _variables = variables; Path = path; }\n")
+        sb.Append("    public class PlcSymbol<T>\n    {\n")
+          .Append("        protected readonly ETS.TwinCAT.Interfaces.IVariablesProvider Variables;\n")
+          .Append("        protected readonly ETS.TwinCAT.Ads.PlcConnection Connection;\n")
+          .Append("        public PlcSymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, string path) : this(variables, null, path) { }\n")
+          .Append("        internal PlcSymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path)\n")
+          .Append("        { if (variables == null) throw new System.ArgumentNullException(\"variables\"); Variables = variables; Connection = connection; Path = path; }\n")
           .Append("        public string Path { get; private set; }\n")
-          .Append("        public T Read() { return _variables.ReadValue<T>(Path); }\n")
-          .Append("        public void Write(T value) { _variables.WriteValue<T>(Path, value); }\n")
-          .Append("        public override string ToString() { return Path; }\n    }\n\n")
-          .Append("    public sealed class PlcArraySymbol<T>\n    {\n")
+          .Append("        public T Read() { return Variables.ReadValue<T>(Path); }\n")
+          .Append("        public void Write(T value) { Variables.WriteValue<T>(Path, value); }\n")
+          .Append("        public override string ToString() { return Path; }\n    }\n\n");
+        if (_config.GenerateSubscriptions)
+            sb.Append("    public sealed class PlcSubscribableSymbol<T> : PlcSymbol<T>\n    {\n")
+          .Append("        public PlcSubscribableSymbol(ETS.TwinCAT.Ads.PlcConnection connection, string path)\n")
+          .Append("            : base(connection == null ? throw new System.ArgumentNullException(\"connection\") : connection.VariablesProvider, connection, path) { }\n")
+          .Append("        internal PlcSubscribableSymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path)\n")
+          .Append("            : base(variables, connection, path) { }\n")
+          .Append("        public ETS.PlcVariables.PlcSubscription<T> Subscribe(System.EventHandler<ETS.PlcVariables.PlcVariableValueChangedEventArgs> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)\n")
+          .Append("        { return RequiredConnection().Subscribe<T>(Path, handler, settings); }\n")
+          .Append("        public ETS.PlcVariables.PlcSubscription<T> Subscribe(System.Action<T> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)\n")
+          .Append("        { return RequiredConnection().Subscribe<T>(Path, handler, settings); }\n")
+          .Append("        private ETS.TwinCAT.Ads.PlcConnection RequiredConnection()\n        {\n")
+          .Append("            if (Connection == null) throw new System.InvalidOperationException(\"Subscribe requires a root constructed with PlcConnection.\");\n")
+          .Append("            return Connection;\n        }\n    }\n\n");
+        sb.Append("    public sealed class PlcArraySymbol<T>\n    {\n")
           .Append("        private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;\n")
+          .Append("        private readonly ETS.TwinCAT.Ads.PlcConnection _connection;\n")
           .Append("        private readonly int[] _lowerBounds;\n        private readonly int[] _upperBounds;\n")
           .Append("        public PlcArraySymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, string path, int[] lowerBounds, int[] upperBounds)\n")
-          .Append("        { _variables = variables; Path = path; _lowerBounds = lowerBounds; _upperBounds = upperBounds; }\n")
+          .Append("            : this(variables, null, path, lowerBounds, upperBounds) { }\n")
+          .Append("        internal PlcArraySymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path, int[] lowerBounds, int[] upperBounds)\n")
+          .Append("        { _variables = variables; _connection = connection; Path = path; _lowerBounds = lowerBounds; _upperBounds = upperBounds; }\n")
           .Append("        public string Path { get; private set; }\n")
           .Append("        public int[] LowerBounds { get { return (int[])_lowerBounds.Clone(); } }\n")
           .Append("        public int[] UpperBounds { get { return (int[])_upperBounds.Clone(); } }\n")
           .Append("        public PlcSymbol<T> At(params int[] indices)\n        {\n")
           .Append("            if (indices == null || indices.Length != _lowerBounds.Length) throw new System.ArgumentException(\"Wrong array rank.\", \"indices\");\n")
           .Append("            for (int i = 0; i < indices.Length; i++) if (indices[i] < _lowerBounds[i] || indices[i] > _upperBounds[i]) throw new System.ArgumentOutOfRangeException(\"indices\");\n")
-          .Append("            return new PlcSymbol<T>(_variables, Path + \"[\" + string.Join(\",\", indices) + \"]\");\n        }\n")
+          .Append("            return new PlcSymbol<T>(_variables, _connection, Path + \"[\" + string.Join(\",\", indices) + \"]\");\n        }\n")
           .Append("        public T ReadElement(params int[] indices) { return At(indices).Read(); }\n")
           .Append("        public void WriteElement(T value, params int[] indices) { At(indices).Write(value); }\n")
           .Append("    }\n\n");
@@ -121,22 +145,41 @@ internal sealed class CSharpEmitter
         var nodeName = TypeIdentifier(type) + "Node";
         var dtoName = TypeIdentifier(type) + "Dto";
         sb.Append("    public sealed class ").Append(nodeName).Append("\n    {\n")
-          .Append("        private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;\n        private readonly string _path;\n\n")
+          .Append("        private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;\n")
+          .Append("        private readonly ETS.TwinCAT.Ads.PlcConnection _connection;\n        private readonly string _path;\n\n")
           .Append("        public ").Append(nodeName).Append("(ETS.TwinCAT.Interfaces.IVariablesProvider variables, string path)\n        {\n")
-          .Append("            _variables = variables;\n            _path = path;\n");
+          .Append("            if (variables == null) throw new System.ArgumentNullException(\"variables\");\n")
+          .Append("            _variables = variables;\n            _path = path;\n            Initialize();\n        }\n\n")
+          .Append("        public ").Append(nodeName).Append("(ETS.TwinCAT.Ads.PlcConnection connection, string path)\n        {\n")
+          .Append("            if (connection == null) throw new System.ArgumentNullException(\"connection\");\n")
+          .Append("            _connection = connection;\n            _variables = connection.VariablesProvider;\n            _path = path;\n            Initialize();\n        }\n\n")
+          .Append("        internal ").Append(nodeName).Append("(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path)\n        {\n")
+          .Append("            _variables = variables;\n            _connection = connection;\n            _path = path;\n            Initialize();\n        }\n\n")
+          .Append("        private void Initialize()\n        {\n");
         var names = UniqueMemberNames(type.Fields.Select(x => x.Name).ToList());
         for (var i = 0; i < type.Fields.Count; i++)
         {
             var field = type.Fields[i];
             sb.Append("            ").Append(names[i]).Append(" = new ").Append(WrapperType(field.Type, field.Dimensions))
-              .Append("(_variables, _path + \".").Append(Escape(field.Name)).Append('"');
+              .Append("(_variables, _connection, _path + \".").Append(Escape(field.Name)).Append('"');
             AppendDimensions(sb, field.Dimensions);
             sb.Append(");\n");
         }
         sb.Append("        }\n\n        public string Path { get { return _path; } }\n\n");
         if (IsReliable(type, new HashSet<string>()))
+        {
             sb.Append("        public ").Append(dtoName).Append(" Read() { return _variables.ReadValue<").Append(dtoName).Append(">(_path); }\n")
-              .Append("        public void Write(").Append(dtoName).Append(" value) { _variables.WriteValue<").Append(dtoName).Append(">(_path, value); }\n\n");
+              .Append("        public void Write(").Append(dtoName).Append(" value) { _variables.WriteValue<").Append(dtoName).Append(">(_path, value); }\n");
+            if (_config.GenerateSubscriptions)
+                sb.Append("        public ETS.PlcVariables.PlcSubscription<").Append(dtoName).Append("> Subscribe(System.EventHandler<ETS.PlcVariables.PlcVariableValueChangedEventArgs> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)\n")
+              .Append("        { return RequiredConnection().Subscribe<").Append(dtoName).Append(">(_path, handler, settings); }\n")
+              .Append("        public ETS.PlcVariables.PlcSubscription<").Append(dtoName).Append("> Subscribe(System.Action<").Append(dtoName).Append("> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)\n")
+              .Append("        { return RequiredConnection().Subscribe<").Append(dtoName).Append(">(_path, handler, settings); }\n")
+              .Append("        private ETS.TwinCAT.Ads.PlcConnection RequiredConnection()\n        {\n")
+              .Append("            if (_connection == null) throw new System.InvalidOperationException(\"Subscribe requires a root constructed with PlcConnection.\");\n")
+              .Append("            return _connection;\n        }\n\n");
+            else sb.Append('\n');
+        }
         for (var i = 0; i < type.Fields.Count; i++)
             sb.Append("        public ").Append(WrapperType(type.Fields[i].Type, type.Fields[i].Dimensions)).Append(' ').Append(names[i]).Append(" { get; private set; }\n");
         sb.Append("    }\n\n");
@@ -264,6 +307,9 @@ internal sealed class CSharpEmitter
         var type = _model.Resolve(reference);
         if (dimensions.Count > 0) return "PlcArraySymbol<" + CsType(reference) + ">";
         if (type?.Fields.Count > 0) return TypeIdentifier(type) + "Node";
+        var kind = Kind(reference, type, dimensions);
+        if (_config.GenerateSubscriptions && (kind == PlcTypeKind.Primitive || kind == PlcTypeKind.Enum))
+            return "PlcSubscribableSymbol<" + CsType(reference) + ">";
         return "PlcSymbol<" + CsType(reference) + ">";
     }
 

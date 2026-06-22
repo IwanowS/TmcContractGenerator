@@ -13,6 +13,8 @@ Each consuming SDK-style project owns its TMC, JSON config, and generated files:
 
 Generated output must be under `$(TmcContractGeneratedRoot)`, which defaults to the project's `Generated` directory. Use a distinct output directory and namespace for each config.
 
+Subscriptions are opt-in. Set `"generateSubscriptions": true` and construct the generated root with `PlcConnection`; only supported leaf symbols and DTO nodes with a verified binary layout expose `Subscribe(...)`. Constructing a root never creates ADS notifications by itself.
+
 Run manually with Windows PowerShell:
 
 ```powershell

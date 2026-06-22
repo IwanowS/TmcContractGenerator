@@ -25,6 +25,9 @@ public sealed class GeneratorConfig
     [JsonPropertyName("generateWrappers")]
     public bool GenerateWrappers { get; set; } = true;
 
+    [JsonPropertyName("generateSubscriptions")]
+    public bool GenerateSubscriptions { get; set; }
+
     [JsonPropertyName("unknownTypeIsError")]
     public bool UnknownTypeIsError { get; set; }
 }

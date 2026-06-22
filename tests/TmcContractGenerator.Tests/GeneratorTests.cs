@@ -30,12 +30,18 @@ public sealed class GeneratorTests
         var dto = Read("Generated/PlcRoot_MachinePlc.Dto.g.cs");
         var manifest = Read("Generated/PlcRoot_MachinePlc.Manifest.g.cs");
         StringAssert.Contains(wrappers, "public sealed partial class PlcRoot_MachinePlc");
+        StringAssert.Contains(wrappers, "public PlcRoot_MachinePlc(ETS.TwinCAT.Ads.PlcConnection connection)");
+        StringAssert.Contains(wrappers, "public PlcSubscribableSymbol<bool> IsReady");
+        StringAssert.Contains(wrappers, "public PlcSymbol<string> Title");
         StringAssert.Contains(wrappers, "public PlcArraySymbol<string> Names");
         StringAssert.Contains(wrappers, "new int[] { 1, -1 }, new int[] { 2, 0 }");
         StringAssert.Contains(dto, "LayoutKind.Explicit");
         StringAssert.Contains(dto, "public sealed class StHmiDto");
         StringAssert.Contains(dto, "Class = 1");
         StringAssert.Contains(manifest, "BinaryLayoutReliable = false");
+
+        StringAssert.Contains(wrappers, "PlcSubscription<StStateDto> Subscribe");
+        Assert.IsFalse(wrappers.Contains("PlcSubscription<StHmiDto>"));
     }
 
     [TestMethod]
@@ -123,16 +129,30 @@ public sealed class GeneratorTests
         Assert.IsTrue(File.Exists(Path.Combine(output, "PlcRoot_MachinePlc.g.cs")));
     }
 
+    [TestMethod]
+    public void SubscriptionApiIsOptIn()
+    {
+        var configPath = WriteConfig(new[] { "GVL_HMI.HMI" });
+        var config = JsonSerializer.Deserialize<GeneratorConfig>(File.ReadAllText(configPath))!;
+        config.GenerateSubscriptions = false;
+        File.WriteAllText(configPath, JsonSerializer.Serialize(config));
+        ContractGenerator.Generate(configPath);
+        var wrappers = Read("Generated/PlcRoot_MachinePlc.g.cs");
+        Assert.IsFalse(wrappers.Contains("PlcSubscription"));
+        Assert.IsFalse(wrappers.Contains("PlcSubscribableSymbol"));
+    }
+
     private string WriteConfig(string[] roots)
     {
         var path = Path.Combine(_directory, "contract.json");
         File.WriteAllText(path, JsonSerializer.Serialize(new GeneratorConfig
         {
             Tmc = "MachinePlc.tmc", Namespace = "Example.Generated", Roots = roots, Output = "Generated",
-            GenerateDto = true, GenerateManifest = true, GenerateWrappers = true
+            GenerateDto = true, GenerateManifest = true, GenerateWrappers = true, GenerateSubscriptions = true
         }));
         return path;
     }
 
     private string Read(string relative) => File.ReadAllText(Path.Combine(_directory, relative.Replace('/', Path.DirectorySeparatorChar)));
+
 }
