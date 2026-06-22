@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/TmcContractGenerator/TmcContractGenerator.csproj" />
+  <Project Path="tests/TmcContractGenerator.Tests/TmcContractGenerator.Tests.csproj" />
+</Solution>

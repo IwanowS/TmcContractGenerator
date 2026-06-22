@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="MSTest" Version="3.6.1" />
+    <ProjectReference Include="..\..\src\TmcContractGenerator\TmcContractGenerator.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Fixtures\Simple.tmc" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

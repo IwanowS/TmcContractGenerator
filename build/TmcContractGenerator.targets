@@ -1,0 +1,20 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <TmcContractGeneratedRoot Condition="'$(TmcContractGeneratedRoot)' == ''">$(MSBuildProjectDirectory)\Generated</TmcContractGeneratedRoot>
+    <TmcContractPowerShell Condition="'$(TmcContractPowerShell)' == ''">powershell.exe</TmcContractPowerShell>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="$(TmcContractGeneratedRoot)\**\*.g.cs" />
+  </ItemGroup>
+
+  <Target Name="GenerateTmcContracts"
+          BeforeTargets="CoreCompile"
+          Condition="'@(TmcContract)' != ''">
+    <Exec Command="&quot;$(TmcContractPowerShell)&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)..\scripts\Generate-PlcContract.ps1&quot; -Config &quot;%(TmcContract.FullPath)&quot;" />
+    <ItemGroup>
+      <Compile Remove="$(TmcContractGeneratedRoot)\**\*.g.cs" />
+      <Compile Include="$(TmcContractGeneratedRoot)\**\*.g.cs" />
+    </ItemGroup>
+  </Target>
+</Project>

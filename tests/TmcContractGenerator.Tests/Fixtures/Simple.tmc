@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<t:TcModuleClass xmlns:t="urn:test">
+  <t:DataTypes>
+    <t:DataType>
+      <t:Name GUID="{MODE}">E_Mode</t:Name><t:BitSize>16</t:BitSize><t:BaseType>INT</t:BaseType>
+      <t:EnumInfo><t:Text>idle</t:Text><t:Enum>0</t:Enum></t:EnumInfo>
+      <t:EnumInfo><t:Text>class</t:Text><t:Enum>1</t:Enum></t:EnumInfo>
+    </t:DataType>
+    <t:DataType>
+      <t:Name GUID="{STATE}">ST_State</t:Name><t:BitSize>64</t:BitSize>
+      <t:SubItem><t:Name>is-ready</t:Name><t:Type>BOOL</t:Type><t:BitSize>8</t:BitSize><t:BitOffs>0</t:BitOffs></t:SubItem>
+      <t:SubItem><t:Name>Mode</t:Name><t:Type GUID="{MODE}">E_Mode</t:Type><t:BitSize>16</t:BitSize><t:BitOffs>16</t:BitOffs></t:SubItem>
+      <t:SubItem><t:Name>Position</t:Name><t:Type>REAL</t:Type><t:BitSize>32</t:BitSize><t:BitOffs>32</t:BitOffs></t:SubItem>
+    </t:DataType>
+    <t:DataType>
+      <t:Name GUID="{HMI}">ST_Hmi</t:Name><t:BitSize>256</t:BitSize>
+      <t:SubItem><t:Name>State</t:Name><t:Type GUID="{STATE}">ST_State</t:Type><t:BitSize>64</t:BitSize><t:BitOffs>0</t:BitOffs></t:SubItem>
+      <t:SubItem><t:Name>Names</t:Name><t:Type>STRING(7)</t:Type><t:ArrayInfo><t:LBound>1</t:LBound><t:Elements>2</t:Elements></t:ArrayInfo><t:ArrayInfo><t:LBound>-1</t:LBound><t:Elements>2</t:Elements></t:ArrayInfo><t:BitSize>128</t:BitSize><t:BitOffs>64</t:BitOffs></t:SubItem>
+      <t:SubItem><t:Name>Pointer</t:Name><t:Type PointerTo="1">BOOL</t:Type><t:BitSize>32</t:BitSize><t:BitOffs>192</t:BitOffs></t:SubItem>
+    </t:DataType>
+  </t:DataTypes>
+  <t:Modules><t:Module><t:DataAreas><t:DataArea>
+    <t:Symbol><t:Name>GVL_HMI.HMI</t:Name><t:BitSize>256</t:BitSize><t:BaseType GUID="{HMI}">ST_Hmi</t:BaseType></t:Symbol>
+    <t:Symbol><t:Name>GVL_HMI.Counter</t:Name><t:BitSize>16</t:BitSize><t:BaseType>UINT</t:BaseType></t:Symbol>
+  </t:DataArea></t:DataAreas></t:Module></t:Modules>
+</t:TcModuleClass>
