@@ -108,7 +108,7 @@ internal sealed class CSharpEmitter
           .Append("        public void Write(T value) { Variables.WriteValue<T>(Path, value); }\n")
           .Append("        public override string ToString() { return Path; }\n    }\n\n");
         if (_config.GenerateSubscriptions)
-            sb.Append("    public sealed class PlcSubscribableSymbol<T> : PlcSymbol<T>\n    {\n")
+            sb.Append("    public sealed class PlcSubscribableSymbol<T> : PlcSymbol<T>, ETS.PlcVariables.IPlcSubscribableSymbol<T>\n    {\n")
           .Append("        public PlcSubscribableSymbol(ETS.TwinCAT.Ads.PlcConnection connection, string path)\n")
           .Append("            : base(connection == null ? throw new System.ArgumentNullException(\"connection\") : connection.VariablesProvider, connection, path) { }\n")
           .Append("        internal PlcSubscribableSymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path)\n")
@@ -117,6 +117,8 @@ internal sealed class CSharpEmitter
           .Append("        { return RequiredConnection().Subscribe<T>(Path, handler, settings); }\n")
           .Append("        public ETS.PlcVariables.PlcSubscription<T> Subscribe(System.Action<T> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)\n")
           .Append("        { return RequiredConnection().Subscribe<T>(Path, handler, settings); }\n")
+          .Append("        System.IDisposable ETS.PlcVariables.IPlcSubscribableSymbol<T>.Subscribe(System.EventHandler<ETS.PlcVariables.PlcVariableValueChangedEventArgs> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings)\n")
+          .Append("        { return Subscribe(handler, settings); }\n")
           .Append("        private ETS.TwinCAT.Ads.PlcConnection RequiredConnection()\n        {\n")
           .Append("            if (Connection == null) throw new System.InvalidOperationException(\"Subscribe requires a root constructed with PlcConnection.\");\n")
           .Append("            return Connection;\n        }\n    }\n\n");
@@ -144,7 +146,11 @@ internal sealed class CSharpEmitter
     {
         var nodeName = TypeIdentifier(type) + "Node";
         var dtoName = TypeIdentifier(type) + "Dto";
-        sb.Append("    public sealed class ").Append(nodeName).Append("\n    {\n")
+        var bindable = _config.GenerateSubscriptions && IsReliable(type, new HashSet<string>());
+        sb.Append("    public sealed class ").Append(nodeName);
+        if (bindable)
+            sb.Append(" : ETS.PlcVariables.IPlcSubscribableSymbol<").Append(dtoName).Append('>');
+        sb.Append("\n    {\n")
           .Append("        private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;\n")
           .Append("        private readonly ETS.TwinCAT.Ads.PlcConnection _connection;\n        private readonly string _path;\n\n")
           .Append("        public ").Append(nodeName).Append("(ETS.TwinCAT.Interfaces.IVariablesProvider variables, string path)\n        {\n")
@@ -175,6 +181,8 @@ internal sealed class CSharpEmitter
               .Append("        { return RequiredConnection().Subscribe<").Append(dtoName).Append(">(_path, handler, settings); }\n")
               .Append("        public ETS.PlcVariables.PlcSubscription<").Append(dtoName).Append("> Subscribe(System.Action<").Append(dtoName).Append("> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)\n")
               .Append("        { return RequiredConnection().Subscribe<").Append(dtoName).Append(">(_path, handler, settings); }\n")
+              .Append("        System.IDisposable ETS.PlcVariables.IPlcSubscribableSymbol<").Append(dtoName).Append(">.Subscribe(System.EventHandler<ETS.PlcVariables.PlcVariableValueChangedEventArgs> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings)\n")
+              .Append("        { return Subscribe(handler, settings); }\n")
               .Append("        private ETS.TwinCAT.Ads.PlcConnection RequiredConnection()\n        {\n")
               .Append("            if (_connection == null) throw new System.InvalidOperationException(\"Subscribe requires a root constructed with PlcConnection.\");\n")
               .Append("            return _connection;\n        }\n\n");

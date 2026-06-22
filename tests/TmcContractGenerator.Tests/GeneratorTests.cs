@@ -32,6 +32,9 @@ public sealed class GeneratorTests
         StringAssert.Contains(wrappers, "public sealed partial class PlcRoot_MachinePlc");
         StringAssert.Contains(wrappers, "public PlcRoot_MachinePlc(ETS.TwinCAT.Ads.PlcConnection connection)");
         StringAssert.Contains(wrappers, "public PlcSubscribableSymbol<bool> IsReady");
+        StringAssert.Contains(wrappers, "PlcSubscribableSymbol<T> : PlcSymbol<T>, ETS.PlcVariables.IPlcSubscribableSymbol<T>");
+        StringAssert.Contains(wrappers, "StStateNode : ETS.PlcVariables.IPlcSubscribableSymbol<StStateDto>");
+        Assert.IsFalse(wrappers.Contains("StHmiNode : ETS.PlcVariables.IPlcSubscribableSymbol<StHmiDto>"));
         StringAssert.Contains(wrappers, "public PlcSymbol<string> Title");
         StringAssert.Contains(wrappers, "public PlcArraySymbol<string> Names");
         StringAssert.Contains(wrappers, "new int[] { 1, -1 }, new int[] { 2, 0 }");
@@ -140,6 +143,7 @@ public sealed class GeneratorTests
         var wrappers = Read("Generated/PlcRoot_MachinePlc.g.cs");
         Assert.IsFalse(wrappers.Contains("PlcSubscription"));
         Assert.IsFalse(wrappers.Contains("PlcSubscribableSymbol"));
+        Assert.IsFalse(wrappers.Contains("IPlcSubscribableSymbol"));
     }
 
     private string WriteConfig(string[] roots)
