@@ -68,6 +68,33 @@ public sealed class GeneratorTests
         StringAssert.Contains(exception.Message, "Configured root symbol not found");
     }
 
+    [TestMethod]
+    public void UnknownPrimitiveCanBePromotedToError()
+    {
+        var tmc = Path.Combine(_directory, "MachinePlc.tmc");
+        File.WriteAllText(tmc, File.ReadAllText(tmc).Replace("<t:Type>REAL</t:Type>", "<t:Type>MYSTERY</t:Type>"));
+        var configPath = WriteConfig(new[] { "GVL_HMI.HMI" });
+        var config = JsonSerializer.Deserialize<GeneratorConfig>(File.ReadAllText(configPath))!;
+        config.UnknownTypeIsError = true;
+        File.WriteAllText(configPath, JsonSerializer.Serialize(config));
+        StringAssert.Contains(Assert.ThrowsException<GeneratorException>(() => ContractGenerator.Generate(configPath)).Message, "Unknown PLC type");
+    }
+
+    [TestMethod]
+    public void OutputDirectoryCannotBeSharedByDifferentTmcFiles()
+    {
+        ContractGenerator.Generate(WriteConfig(new[] { "GVL_HMI.HMI" }));
+        File.Copy(Path.Combine(_directory, "MachinePlc.tmc"), Path.Combine(_directory, "Other.tmc"));
+        var config = new GeneratorConfig
+        {
+            Tmc = "Other.tmc", Namespace = "Other.Generated", Roots = new[] { "GVL_HMI.HMI" }, Output = "Generated",
+            GenerateDto = true, GenerateManifest = true, GenerateWrappers = true
+        };
+        var path = Path.Combine(_directory, "other.json");
+        File.WriteAllText(path, JsonSerializer.Serialize(config));
+        StringAssert.Contains(Assert.ThrowsException<GeneratorException>(() => ContractGenerator.Generate(path)).Message, "already owned");
+    }
+
     private string WriteConfig(string[] roots)
     {
         var path = Path.Combine(_directory, "contract.json");

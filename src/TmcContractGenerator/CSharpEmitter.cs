@@ -46,7 +46,8 @@ internal sealed class CSharpEmitter
     {
         var type = _model.Resolve(reference);
         var kind = Kind(reference, type, dimensions);
-        var reliable = type != null && IsReliable(type, new HashSet<string>());
+        var reliable = kind == PlcTypeKind.Primitive || kind == PlcTypeKind.Enum
+            || (kind == PlcTypeKind.Struct && type != null && IsReliable(type, new HashSet<string>()));
         Items.Add(new ContractItem
         {
             Path = path, PlcTypeName = PlcName(reference), CSharpTypeName = CsType(reference), Kind = kind,
