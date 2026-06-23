@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace TmcContractGenerator;
 
@@ -20,14 +21,14 @@ public static class ContractGenerator
             }) ?? throw new GeneratorException("Config is empty.");
         }
         catch (JsonException ex) { throw new GeneratorException("Invalid generator config: " + configPath, ex); }
-        if (string.IsNullOrWhiteSpace(config.Tmc) || string.IsNullOrWhiteSpace(config.Namespace) || string.IsNullOrWhiteSpace(config.Output))
-            throw new GeneratorException("Config must define tmc, namespace and output.");
+        ValidateConfig(configPath, config);
         if (config.GenerateWrappers && (!config.GenerateDto || !config.GenerateManifest))
             throw new GeneratorException("generateWrappers requires generateDto and generateManifest.");
 
         var configDirectory = Path.GetDirectoryName(configPath)!;
         var tmcPath = Resolve(configDirectory, config.Tmc);
         var outputPath = Resolve(configDirectory, config.Output);
+        ValidateResolvedOutput(configPath, configDirectory, outputPath);
         if (!File.Exists(tmcPath)) throw new GeneratorException("TMC not found: " + tmcPath);
         Directory.CreateDirectory(outputPath);
         EnsureOutputOwnership(outputPath, Path.GetFileName(tmcPath));
@@ -35,7 +36,8 @@ public static class ContractGenerator
         var roots = SelectRoots(model, config.Roots ?? Array.Empty<string>());
         var emitter = new CSharpEmitter(model, config, Path.GetFileName(tmcPath));
         var output = emitter.Emit(roots);
-        if (config.UnknownTypeIsError && emitter.Warnings.Any(x => x.StartsWith("Unknown PLC type", StringComparison.Ordinal)))
+        if (config.UnknownTypeIsError && emitter.Warnings.Any(x => x.StartsWith("Unknown PLC type", StringComparison.Ordinal)
+            || x.StartsWith("Unsupported pointer target PLC type", StringComparison.Ordinal)))
             throw new GeneratorException(string.Join(Environment.NewLine, emitter.Warnings));
 
         var files = new List<string>();
@@ -54,6 +56,72 @@ public static class ContractGenerator
             Warnings = emitter.Warnings.ToArray(),
             Files = files.ToArray()
         };
+    }
+
+    private static void ValidateConfig(string configPath, GeneratorConfig config)
+    {
+        if (string.IsNullOrWhiteSpace(config.Tmc))
+            throw new GeneratorException("Config '" + configPath + "' must define tmc.");
+        if (string.IsNullOrWhiteSpace(config.Namespace))
+            throw new GeneratorException("Config '" + configPath + "' must define namespace.");
+        if (string.IsNullOrWhiteSpace(config.Output))
+            throw new GeneratorException("Config '" + configPath + "' must define output.");
+
+        var ns = config.Namespace.Trim();
+        if (!IsValidNamespace(ns))
+            throw new GeneratorException("Config '" + configPath + "' has invalid namespace: " + config.Namespace);
+        config.Namespace = ns;
+
+        var roots = config.Roots ?? Array.Empty<string>();
+        var normalizedRoots = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var root in roots)
+        {
+            var value = root?.Trim() ?? string.Empty;
+            if (value.Length == 0)
+                throw new GeneratorException("Config '" + configPath + "' contains an empty root.");
+            if (!seen.Add(value))
+                throw new GeneratorException("Config '" + configPath + "' contains duplicate root: " + value);
+            normalizedRoots.Add(value);
+        }
+        config.Roots = normalizedRoots.ToArray();
+    }
+
+    private static void ValidateResolvedOutput(string configPath, string configDirectory, string outputPath)
+    {
+        var normalizedConfigDirectory = Path.GetFullPath(configDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var normalizedOutput = Path.GetFullPath(outputPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (string.Equals(normalizedOutput, normalizedConfigDirectory, StringComparison.OrdinalIgnoreCase))
+            throw new GeneratorException("Config '" + configPath + "' output cannot be the config directory itself: " + outputPath);
+
+        var generatorRoot = FindGeneratorRoot();
+        if (generatorRoot != null && IsInsideDirectory(normalizedOutput, generatorRoot))
+            throw new GeneratorException("Config '" + configPath + "' output cannot be inside the generator repository: " + outputPath);
+    }
+
+    private static bool IsValidNamespace(string value)
+    {
+        if (value.Length == 0 || value.Contains("..", StringComparison.Ordinal)) return false;
+        return value.Split('.').All(segment => Regex.IsMatch(segment, @"^@?[A-Za-z_][A-Za-z0-9_]*$"));
+    }
+
+    private static string? FindGeneratorRoot()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory != null)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "build", "TmcContractGenerator.targets")))
+                return directory.FullName.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            directory = directory.Parent;
+        }
+        return null;
+    }
+
+    private static bool IsInsideDirectory(string path, string directory)
+    {
+        var normalizedDirectory = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var normalizedPath = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        return normalizedPath.StartsWith(normalizedDirectory, StringComparison.OrdinalIgnoreCase);
     }
 
     private static List<PlcSymbol> SelectRoots(TmcModel model, string[] configured)

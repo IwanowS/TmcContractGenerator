@@ -13,12 +13,14 @@ internal sealed class CSharpEmitter
         ["UDINT"] = "uint", ["DINT"] = "int", ["LWORD"] = "ulong", ["ULINT"] = "ulong",
         ["LINT"] = "long", ["REAL"] = "float", ["LREAL"] = "double", ["TIME"] = "uint"
     };
+
     private readonly TmcModel _model;
     private readonly GeneratorConfig _config;
     private readonly string _tmcName;
     private readonly string _rootClass;
     private readonly Dictionary<string, bool> _layout = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _unknown = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _unsupportedPointers = new(StringComparer.OrdinalIgnoreCase);
 
     public CSharpEmitter(TmcModel model, GeneratorConfig config, string tmcName)
     {
@@ -33,8 +35,11 @@ internal sealed class CSharpEmitter
 
     public Dictionary<string, string> Emit(List<PlcSymbol> roots)
     {
-        foreach (var root in roots) Flatten(root.Path, root.Type, root.BitSize, root.Comment, root.Dimensions, new HashSet<string>());
+        foreach (var root in roots)
+            Flatten(root.Path, root.Type, root.BitSize, root.Comment, root.Dimensions, new HashSet<string>());
+
         Items.Sort((a, b) => StringComparer.Ordinal.Compare(a.Path, b.Path));
+
         var files = new Dictionary<string, string>(StringComparer.Ordinal);
         if (_config.GenerateWrappers) files[_rootClass + ".g.cs"] = EmitWrappers(roots);
         if (_config.GenerateDto) files[_rootClass + ".Dto.g.cs"] = EmitDtos();
@@ -47,217 +52,340 @@ internal sealed class CSharpEmitter
         var type = _model.Resolve(reference);
         var kind = Kind(reference, type, dimensions);
         var reliable = kind == PlcTypeKind.Primitive || kind == PlcTypeKind.Enum
-            || (kind == PlcTypeKind.Struct && type != null && IsReliable(type, new HashSet<string>()));
+            || (kind == PlcTypeKind.Struct && type != null && CanGenerateRawDto(type, new HashSet<string>()));
+
+        if (kind == PlcTypeKind.Pointer && !IsSupportedPointerTarget(reference, type))
+            UnsupportedPointer(reference);
+
         Items.Add(new ContractItem
         {
-            Path = path, PlcTypeName = PlcName(reference), CSharpTypeName = CsType(reference), Kind = kind,
-            Size = bits.HasValue && bits.Value % 8 == 0 ? bits.Value / 8 : null, Comment = comment,
-            BinaryLayoutReliable = reliable, Dimensions = dimensions, Type = reference
+            Path = path,
+            PlcTypeName = PlcName(reference),
+            CSharpTypeName = CsLogicalType(reference),
+            Kind = kind,
+            Size = bits.HasValue && bits.Value % 8 == 0 ? bits.Value / 8 : null,
+            Comment = comment,
+            BinaryLayoutReliable = reliable,
+            Dimensions = dimensions,
+            Type = reference
         });
-        if ((kind != PlcTypeKind.Struct && kind != PlcTypeKind.Namespace) || type == null || !stack.Add(type.QualifiedName)) return;
+
+        if ((kind != PlcTypeKind.Struct && kind != PlcTypeKind.Namespace && kind != PlcTypeKind.Pointer)
+            || type == null
+            || type.Fields.Count == 0
+            || !stack.Add(type.QualifiedName))
+            return;
+
+        var childPrefix = kind == PlcTypeKind.Pointer ? path + "^." : path + ".";
         foreach (var field in type.Fields)
-            Flatten(path + "." + field.Name, field.Type, field.BitSize, field.Comment, field.Dimensions, stack);
+            Flatten(childPrefix + field.Name, field.Type, field.BitSize, field.Comment, field.Dimensions, stack);
         stack.Remove(type.QualifiedName);
     }
 
     private string EmitWrappers(List<PlcSymbol> roots)
     {
-        var sb = Header();
-        sb.Append("namespace ").Append(_config.Namespace).Append("\n{\n");
-        EmitSymbolHelpers(sb);
-        var reachable = ReachableTypes(roots.Select(x => x.Type));
-        foreach (var type in reachable.Where(x => x.Fields.Count > 0).OrderBy(x => x.QualifiedName, StringComparer.Ordinal)) EmitNode(sb, type);
-        sb.Append("    public sealed partial class ").Append(_rootClass).Append("\n    {\n")
-          .Append("        private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;\n")
-          .Append("        private readonly ETS.TwinCAT.Ads.PlcConnection _connection;\n\n")
-          .Append("        public ").Append(_rootClass).Append("(ETS.TwinCAT.Interfaces.IVariablesProvider variables)\n        {\n")
-          .Append("            if (variables == null) throw new System.ArgumentNullException(\"variables\");\n")
-          .Append("            _variables = variables;\n            Initialize();\n        }\n\n")
-          .Append("        public ").Append(_rootClass).Append("(ETS.TwinCAT.Ads.PlcConnection connection)\n        {\n")
-          .Append("            if (connection == null) throw new System.ArgumentNullException(\"connection\");\n")
-          .Append("            _connection = connection;\n            _variables = connection.VariablesProvider;\n            Initialize();\n        }\n\n")
-          .Append("        private void Initialize()\n        {\n");
-        var rootNames = UniqueMemberNames(roots.Select(x => x.Path.Split('.').Last()).ToList());
-        for (var i = 0; i < roots.Count; i++)
+        var writer = Header();
+        using (writer.Block("namespace " + _config.Namespace))
         {
-            var root = roots[i];
-            sb.Append("            ").Append(rootNames[i]).Append(" = new ").Append(WrapperType(root.Type, root.Dimensions))
-              .Append("(_variables, _connection, \"").Append(Escape(root.Path)).Append('"');
-            AppendDimensions(sb, root.Dimensions);
-            sb.Append(");\n");
+            EmitSymbolHelpers(writer);
+
+            var reachable = ReachableTypes(roots.Select(x => x.Type));
+            foreach (var type in reachable.Where(x => x.Fields.Count > 0).OrderBy(x => x.QualifiedName, StringComparer.Ordinal))
+                EmitNode(writer, type, isPointerNode: false);
+
+            var pointerTypes = ReachablePointerStructTypes(roots.Select(x => x.Type));
+            foreach (var type in pointerTypes.OrderBy(x => x.QualifiedName, StringComparer.Ordinal))
+                EmitNode(writer, type, isPointerNode: true);
+
+            using (writer.Block("public sealed partial class " + _rootClass))
+            {
+                writer.Line("private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;");
+                writer.Line("private readonly ETS.TwinCAT.Ads.PlcConnection _connection;");
+                writer.Line();
+                using (writer.Block("public " + _rootClass + "(ETS.TwinCAT.Interfaces.IVariablesProvider variables)"))
+                {
+                    writer.Line("if (variables == null) throw new System.ArgumentNullException(\"variables\");");
+                    writer.Line("_variables = variables;");
+                    writer.Line("Initialize();");
+                }
+                writer.Line();
+                using (writer.Block("public " + _rootClass + "(ETS.TwinCAT.Ads.PlcConnection connection)"))
+                {
+                    writer.Line("if (connection == null) throw new System.ArgumentNullException(\"connection\");");
+                    writer.Line("_connection = connection;");
+                    writer.Line("_variables = connection.VariablesProvider;");
+                    writer.Line("Initialize();");
+                }
+                writer.Line();
+                using (writer.Block("private void Initialize()"))
+                {
+                    var rootNames = UniqueMemberNames(roots.Select(x => x.Path.Split('.').Last()).ToList());
+                    for (var i = 0; i < roots.Count; i++)
+                    {
+                        var root = roots[i];
+                        writer.Line(rootNames[i] + " = new " + WrapperType(root.Type, root.Dimensions) + "(_variables, _connection, \""
+                            + Escape(SymbolAccessPath(root.Path, root.Type)) + "\"" + DimensionsArgument(root.Dimensions) + ");");
+                    }
+                }
+                writer.Line();
+
+                var names = UniqueMemberNames(roots.Select(x => x.Path.Split('.').Last()).ToList());
+                for (var i = 0; i < roots.Count; i++)
+                {
+                    writer.Line("public " + WrapperType(roots[i].Type, roots[i].Dimensions) + " " + names[i] + " { get; private set; }");
+                    writer.Line();
+                }
+
+                using (writer.Block("public static ETS.PlcVariables.Contracts.PlcContractManifest Contract"))
+                {
+                    writer.Line("get { return " + _rootClass + "Manifest.Value; }");
+                }
+            }
         }
-        sb.Append("        }\n\n");
-        for (var i = 0; i < roots.Count; i++)
-            sb.Append("        public ").Append(WrapperType(roots[i].Type, roots[i].Dimensions)).Append(' ').Append(rootNames[i]).Append(" { get; private set; }\n\n");
-        sb.Append("        public static ETS.PlcVariables.Contracts.PlcContractManifest Contract\n        {\n")
-          .Append("            get { return ").Append(_rootClass).Append("Manifest.Value; }\n        }\n")
-          .Append("    }\n}\n");
-        return sb.ToString();
+        return writer.ToString();
     }
 
-    private void EmitSymbolHelpers(StringBuilder sb)
+    private void EmitSymbolHelpers(CodeWriter writer)
     {
-        sb.Append("    public class PlcSymbol<T>\n    {\n")
-          .Append("        protected readonly ETS.TwinCAT.Interfaces.IVariablesProvider Variables;\n")
-          .Append("        protected readonly ETS.TwinCAT.Ads.PlcConnection Connection;\n")
-          .Append("        public PlcSymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, string path) : this(variables, null, path) { }\n")
-          .Append("        internal PlcSymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path)\n")
-          .Append("        { if (variables == null) throw new System.ArgumentNullException(\"variables\"); Variables = variables; Connection = connection; Path = path; }\n")
-          .Append("        public string Path { get; private set; }\n")
-          .Append("        public T Read() { return Variables.ReadValue<T>(Path); }\n")
-          .Append("        public void Write(T value) { Variables.WriteValue<T>(Path, value); }\n")
-          .Append("        public override string ToString() { return Path; }\n    }\n\n");
+        using (writer.Block("public class PlcSymbol<T>"))
+        {
+            writer.Line("protected readonly ETS.TwinCAT.Interfaces.IVariablesProvider Variables;");
+            writer.Line("protected readonly ETS.TwinCAT.Ads.PlcConnection Connection;");
+            writer.Line("public PlcSymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, string path) : this(variables, null, path) { }");
+            writer.Line("internal PlcSymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path)");
+            writer.Line("{ if (variables == null) throw new System.ArgumentNullException(\"variables\"); Variables = variables; Connection = connection; Path = path; }");
+            writer.Line("public string Path { get; private set; }");
+            writer.Line("public T Read() { return Variables.ReadValue<T>(Path); }");
+            writer.Line("public void Write(T value) { Variables.WriteValue<T>(Path, value); }");
+            writer.Line("public override string ToString() { return Path; }");
+        }
+        writer.Line();
+
         if (_config.GenerateSubscriptions)
-            sb.Append("    public sealed class PlcSubscribableSymbol<T> : PlcSymbol<T>, ETS.PlcVariables.IPlcSubscribableSymbol<T>\n    {\n")
-          .Append("        public PlcSubscribableSymbol(ETS.TwinCAT.Ads.PlcConnection connection, string path)\n")
-          .Append("            : base(connection == null ? throw new System.ArgumentNullException(\"connection\") : connection.VariablesProvider, connection, path) { }\n")
-          .Append("        internal PlcSubscribableSymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path)\n")
-          .Append("            : base(variables, connection, path) { }\n")
-          .Append("        public ETS.PlcVariables.PlcSubscription<T> Subscribe(System.EventHandler<ETS.PlcVariables.PlcVariableValueChangedEventArgs> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)\n")
-          .Append("        { return RequiredConnection().Subscribe<T>(Path, handler, settings); }\n")
-          .Append("        public ETS.PlcVariables.PlcSubscription<T> Subscribe(System.Action<T> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)\n")
-          .Append("        { return RequiredConnection().Subscribe<T>(Path, handler, settings); }\n")
-          .Append("        System.IDisposable ETS.PlcVariables.IPlcSubscribableSymbol<T>.Subscribe(System.EventHandler<ETS.PlcVariables.PlcVariableValueChangedEventArgs> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings)\n")
-          .Append("        { return Subscribe(handler, settings); }\n")
-          .Append("        private ETS.TwinCAT.Ads.PlcConnection RequiredConnection()\n        {\n")
-          .Append("            if (Connection == null) throw new System.InvalidOperationException(\"Subscribe requires a root constructed with PlcConnection.\");\n")
-          .Append("            return Connection;\n        }\n    }\n\n");
-        sb.Append("    public sealed class PlcArraySymbol<T>\n    {\n")
-          .Append("        private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;\n")
-          .Append("        private readonly ETS.TwinCAT.Ads.PlcConnection _connection;\n")
-          .Append("        private readonly int[] _lowerBounds;\n        private readonly int[] _upperBounds;\n")
-          .Append("        public PlcArraySymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, string path, int[] lowerBounds, int[] upperBounds)\n")
-          .Append("            : this(variables, null, path, lowerBounds, upperBounds) { }\n")
-          .Append("        internal PlcArraySymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path, int[] lowerBounds, int[] upperBounds)\n")
-          .Append("        { _variables = variables; _connection = connection; Path = path; _lowerBounds = lowerBounds; _upperBounds = upperBounds; }\n")
-          .Append("        public string Path { get; private set; }\n")
-          .Append("        public int[] LowerBounds { get { return (int[])_lowerBounds.Clone(); } }\n")
-          .Append("        public int[] UpperBounds { get { return (int[])_upperBounds.Clone(); } }\n")
-          .Append("        public PlcSymbol<T> At(params int[] indices)\n        {\n")
-          .Append("            if (indices == null || indices.Length != _lowerBounds.Length) throw new System.ArgumentException(\"Wrong array rank.\", \"indices\");\n")
-          .Append("            for (int i = 0; i < indices.Length; i++) if (indices[i] < _lowerBounds[i] || indices[i] > _upperBounds[i]) throw new System.ArgumentOutOfRangeException(\"indices\");\n")
-          .Append("            return new PlcSymbol<T>(_variables, _connection, Path + \"[\" + string.Join(\",\", indices) + \"]\");\n        }\n")
-          .Append("        public T ReadElement(params int[] indices) { return At(indices).Read(); }\n")
-          .Append("        public void WriteElement(T value, params int[] indices) { At(indices).Write(value); }\n")
-          .Append("    }\n\n");
+        {
+            using (writer.Block("public sealed class PlcSubscribableSymbol<T> : PlcSymbol<T>, ETS.PlcVariables.IPlcSubscribableSymbol<T>"))
+            {
+                writer.Line("public PlcSubscribableSymbol(ETS.TwinCAT.Ads.PlcConnection connection, string path)");
+                writer.Line("    : base(connection == null ? throw new System.ArgumentNullException(\"connection\") : connection.VariablesProvider, connection, path) { }");
+                writer.Line("internal PlcSubscribableSymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path)");
+                writer.Line("    : base(variables, connection, path) { }");
+                writer.Line("public ETS.PlcVariables.PlcSubscription<T> Subscribe(System.EventHandler<ETS.PlcVariables.PlcVariableValueChangedEventArgs> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)");
+                writer.Line("{ return RequiredConnection().Subscribe<T>(Path, handler, settings); }");
+                writer.Line("public ETS.PlcVariables.PlcSubscription<T> Subscribe(System.Action<T> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)");
+                writer.Line("{ return RequiredConnection().Subscribe<T>(Path, handler, settings); }");
+                writer.Line("System.IDisposable ETS.PlcVariables.IPlcSubscribableSymbol<T>.Subscribe(System.EventHandler<ETS.PlcVariables.PlcVariableValueChangedEventArgs> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings)");
+                writer.Line("{ return Subscribe(handler, settings); }");
+                using (writer.Block("private ETS.TwinCAT.Ads.PlcConnection RequiredConnection()"))
+                {
+                    writer.Line("if (Connection == null) throw new System.InvalidOperationException(\"Subscribe requires a root constructed with PlcConnection.\");");
+                    writer.Line("return Connection;");
+                }
+            }
+            writer.Line();
+        }
+
+        using (writer.Block("public sealed class PlcArraySymbol<T>"))
+        {
+            writer.Line("private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;");
+            writer.Line("private readonly ETS.TwinCAT.Ads.PlcConnection _connection;");
+            writer.Line("private readonly int[] _lowerBounds;");
+            writer.Line("private readonly int[] _upperBounds;");
+            writer.Line("public PlcArraySymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, string path, int[] lowerBounds, int[] upperBounds)");
+            writer.Line("    : this(variables, null, path, lowerBounds, upperBounds) { }");
+            writer.Line("internal PlcArraySymbol(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path, int[] lowerBounds, int[] upperBounds)");
+            writer.Line("{ _variables = variables; _connection = connection; Path = path; _lowerBounds = lowerBounds; _upperBounds = upperBounds; }");
+            writer.Line("public string Path { get; private set; }");
+            writer.Line("public int[] LowerBounds { get { return (int[])_lowerBounds.Clone(); } }");
+            writer.Line("public int[] UpperBounds { get { return (int[])_upperBounds.Clone(); } }");
+            using (writer.Block("public PlcSymbol<T> At(params int[] indices)"))
+            {
+                writer.Line("if (indices == null || indices.Length != _lowerBounds.Length) throw new System.ArgumentException(\"Wrong array rank.\", \"indices\");");
+                writer.Line("for (int i = 0; i < indices.Length; i++) if (indices[i] < _lowerBounds[i] || indices[i] > _upperBounds[i]) throw new System.ArgumentOutOfRangeException(\"indices\");");
+                writer.Line("return new PlcSymbol<T>(_variables, _connection, Path + \"[\" + string.Join(\",\", indices) + \"]\");");
+            }
+            writer.Line("public T ReadElement(params int[] indices) { return At(indices).Read(); }");
+            writer.Line("public void WriteElement(T value, params int[] indices) { At(indices).Write(value); }");
+        }
+        writer.Line();
     }
 
-    private void EmitNode(StringBuilder sb, PlcType type)
+    private void EmitNode(CodeWriter writer, PlcType type, bool isPointerNode)
     {
-        var nodeName = TypeIdentifier(type) + "Node";
-        var dtoName = TypeIdentifier(type) + "Dto";
-        var bindable = _config.GenerateSubscriptions && IsReliable(type, new HashSet<string>());
-        sb.Append("    public sealed class ").Append(nodeName);
-        if (bindable)
-            sb.Append(" : ETS.PlcVariables.IPlcSubscribableSymbol<").Append(dtoName).Append('>');
-        sb.Append("\n    {\n")
-          .Append("        private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;\n")
-          .Append("        private readonly ETS.TwinCAT.Ads.PlcConnection _connection;\n        private readonly string _path;\n\n")
-          .Append("        public ").Append(nodeName).Append("(ETS.TwinCAT.Interfaces.IVariablesProvider variables, string path)\n        {\n")
-          .Append("            if (variables == null) throw new System.ArgumentNullException(\"variables\");\n")
-          .Append("            _variables = variables;\n            _path = path;\n            Initialize();\n        }\n\n")
-          .Append("        public ").Append(nodeName).Append("(ETS.TwinCAT.Ads.PlcConnection connection, string path)\n        {\n")
-          .Append("            if (connection == null) throw new System.ArgumentNullException(\"connection\");\n")
-          .Append("            _connection = connection;\n            _variables = connection.VariablesProvider;\n            _path = path;\n            Initialize();\n        }\n\n")
-          .Append("        internal ").Append(nodeName).Append("(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path)\n        {\n")
-          .Append("            _variables = variables;\n            _connection = connection;\n            _path = path;\n            Initialize();\n        }\n\n")
-          .Append("        private void Initialize()\n        {\n");
-        var names = UniqueMemberNames(type.Fields.Select(x => x.Name).ToList());
-        for (var i = 0; i < type.Fields.Count; i++)
+        var nodeName = TypeIdentifier(type) + (isPointerNode ? "PointerNode" : "Node");
+        var rawDtoName = TypeIdentifier(type) + "RawDto";
+        var canRaw = !isPointerNode && CanGenerateRawDto(type, new HashSet<string>());
+        var bindable = _config.GenerateSubscriptions && canRaw;
+
+        using (writer.Block("public sealed class " + nodeName + (bindable ? " : ETS.PlcVariables.IPlcSubscribableSymbol<" + rawDtoName + ">" : string.Empty)))
         {
-            var field = type.Fields[i];
-            sb.Append("            ").Append(names[i]).Append(" = new ").Append(WrapperType(field.Type, field.Dimensions))
-              .Append("(_variables, _connection, _path + \".").Append(Escape(field.Name)).Append('"');
-            AppendDimensions(sb, field.Dimensions);
-            sb.Append(");\n");
+            writer.Line("private readonly ETS.TwinCAT.Interfaces.IVariablesProvider _variables;");
+            writer.Line("private readonly ETS.TwinCAT.Ads.PlcConnection _connection;");
+            writer.Line("private readonly string _path;");
+            writer.Line();
+
+            using (writer.Block("public " + nodeName + "(ETS.TwinCAT.Interfaces.IVariablesProvider variables, string path)"))
+            {
+                writer.Line("if (variables == null) throw new System.ArgumentNullException(\"variables\");");
+                writer.Line("_variables = variables;");
+                writer.Line("_path = path;");
+                writer.Line("Initialize();");
+            }
+            writer.Line();
+            using (writer.Block("public " + nodeName + "(ETS.TwinCAT.Ads.PlcConnection connection, string path)"))
+            {
+                writer.Line("if (connection == null) throw new System.ArgumentNullException(\"connection\");");
+                writer.Line("_connection = connection;");
+                writer.Line("_variables = connection.VariablesProvider;");
+                writer.Line("_path = path;");
+                writer.Line("Initialize();");
+            }
+            writer.Line();
+            using (writer.Block("internal " + nodeName + "(ETS.TwinCAT.Interfaces.IVariablesProvider variables, ETS.TwinCAT.Ads.PlcConnection connection, string path)"))
+            {
+                writer.Line("_variables = variables;");
+                writer.Line("_connection = connection;");
+                writer.Line("_path = path;");
+                writer.Line("Initialize();");
+            }
+            writer.Line();
+
+            using (writer.Block("private void Initialize()"))
+            {
+                var names = UniqueMemberNames(type.Fields.Select(x => x.Name).ToList());
+                for (var i = 0; i < type.Fields.Count; i++)
+                {
+                    var field = type.Fields[i];
+                    writer.Line(names[i] + " = new " + WrapperType(field.Type, field.Dimensions) + "(_variables, _connection, _path + \""
+                        + Escape(FieldAccessSuffix(field)) + "\"" + DimensionsArgument(field.Dimensions) + ");");
+                }
+            }
+            writer.Line();
+            writer.Line("public string Path { get { return _path; } }");
+            writer.Line();
+
+            if (canRaw)
+            {
+                writer.Line("public " + rawDtoName + " ReadRaw() { return _variables.ReadValue<" + rawDtoName + ">(_path); }");
+                writer.Line("public void WriteRaw(" + rawDtoName + " value) { _variables.WriteValue<" + rawDtoName + ">(_path, value); }");
+                if (_config.GenerateSubscriptions)
+                {
+                    writer.Line(rawDtoName + " ETS.PlcVariables.IPlcSubscribableSymbol<" + rawDtoName + ">.Read()");
+                    writer.Line("{ return ReadRaw(); }");
+                    writer.Line("void ETS.PlcVariables.IPlcSubscribableSymbol<" + rawDtoName + ">.Write(" + rawDtoName + " value)");
+                    writer.Line("{ WriteRaw(value); }");
+                    writer.Line("public ETS.PlcVariables.PlcSubscription<" + rawDtoName + "> Subscribe(System.EventHandler<ETS.PlcVariables.PlcVariableValueChangedEventArgs> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)");
+                    writer.Line("{ return RequiredConnection().Subscribe<" + rawDtoName + ">(_path, handler, settings); }");
+                    writer.Line("public ETS.PlcVariables.PlcSubscription<" + rawDtoName + "> Subscribe(System.Action<" + rawDtoName + "> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)");
+                    writer.Line("{ return RequiredConnection().Subscribe<" + rawDtoName + ">(_path, handler, settings); }");
+                    writer.Line("System.IDisposable ETS.PlcVariables.IPlcSubscribableSymbol<" + rawDtoName + ">.Subscribe(System.EventHandler<ETS.PlcVariables.PlcVariableValueChangedEventArgs> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings)");
+                    writer.Line("{ return Subscribe(handler, settings); }");
+                    using (writer.Block("private ETS.TwinCAT.Ads.PlcConnection RequiredConnection()"))
+                    {
+                        writer.Line("if (_connection == null) throw new System.InvalidOperationException(\"Subscribe requires a root constructed with PlcConnection.\");");
+                        writer.Line("return _connection;");
+                    }
+                }
+                writer.Line();
+            }
+
+            var propertyNames = UniqueMemberNames(type.Fields.Select(x => x.Name).ToList());
+            for (var i = 0; i < type.Fields.Count; i++)
+                writer.Line("public " + WrapperType(type.Fields[i].Type, type.Fields[i].Dimensions) + " " + propertyNames[i] + " { get; private set; }");
         }
-        sb.Append("        }\n\n        public string Path { get { return _path; } }\n\n");
-        if (IsReliable(type, new HashSet<string>()))
-        {
-            sb.Append("        public ").Append(dtoName).Append(" Read() { return _variables.ReadValue<").Append(dtoName).Append(">(_path); }\n")
-              .Append("        public void Write(").Append(dtoName).Append(" value) { _variables.WriteValue<").Append(dtoName).Append(">(_path, value); }\n");
-            if (_config.GenerateSubscriptions)
-                sb.Append("        public ETS.PlcVariables.PlcSubscription<").Append(dtoName).Append("> Subscribe(System.EventHandler<ETS.PlcVariables.PlcVariableValueChangedEventArgs> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)\n")
-              .Append("        { return RequiredConnection().Subscribe<").Append(dtoName).Append(">(_path, handler, settings); }\n")
-              .Append("        public ETS.PlcVariables.PlcSubscription<").Append(dtoName).Append("> Subscribe(System.Action<").Append(dtoName).Append("> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings = null)\n")
-              .Append("        { return RequiredConnection().Subscribe<").Append(dtoName).Append(">(_path, handler, settings); }\n")
-              .Append("        System.IDisposable ETS.PlcVariables.IPlcSubscribableSymbol<").Append(dtoName).Append(">.Subscribe(System.EventHandler<ETS.PlcVariables.PlcVariableValueChangedEventArgs> handler, ETS.TwinCAT.Ads.AdsVariableSettings settings)\n")
-              .Append("        { return Subscribe(handler, settings); }\n")
-              .Append("        private ETS.TwinCAT.Ads.PlcConnection RequiredConnection()\n        {\n")
-              .Append("            if (_connection == null) throw new System.InvalidOperationException(\"Subscribe requires a root constructed with PlcConnection.\");\n")
-              .Append("            return _connection;\n        }\n\n");
-            else sb.Append('\n');
-        }
-        for (var i = 0; i < type.Fields.Count; i++)
-            sb.Append("        public ").Append(WrapperType(type.Fields[i].Type, type.Fields[i].Dimensions)).Append(' ').Append(names[i]).Append(" { get; private set; }\n");
-        sb.Append("    }\n\n");
+        writer.Line();
     }
 
     private string EmitDtos()
     {
-        var sb = Header();
-        sb.Append("namespace ").Append(_config.Namespace).Append("\n{\n");
-        var referenced = ReachableTypes(Items.Select(x => x.Type));
-        foreach (var type in referenced.Where(x => x.EnumValues.Count > 0).OrderBy(x => x.QualifiedName, StringComparer.Ordinal))
+        var writer = Header();
+        using (writer.Block("namespace " + _config.Namespace))
         {
-            sb.Append("    public enum ").Append(TypeIdentifier(type)).Append(" : ").Append(EnumBase(type)).Append("\n    {\n");
-            var names = UniqueNames(type.EnumValues.Select(x => x.Name).ToList());
-            for (var i = 0; i < type.EnumValues.Count; i++)
-                sb.Append("        ").Append(names[i]).Append(" = ").Append(type.EnumValues[i].Value.ToString(CultureInfo.InvariantCulture)).Append(i + 1 == type.EnumValues.Count ? "\n" : ",\n");
-            sb.Append("    }\n\n");
+            var referenced = ReachableTypes(Items.Select(x => x.Type));
+            foreach (var type in referenced.Where(x => x.EnumValues.Count > 0).OrderBy(x => x.QualifiedName, StringComparer.Ordinal))
+            {
+                using (writer.Block("public enum " + TypeIdentifier(type) + " : " + EnumBase(type)))
+                {
+                    var names = UniqueNames(type.EnumValues.Select(x => x.Name).ToList());
+                    for (var i = 0; i < type.EnumValues.Count; i++)
+                        writer.Line(names[i] + " = " + type.EnumValues[i].Value.ToString(CultureInfo.InvariantCulture) + (i + 1 == type.EnumValues.Count ? string.Empty : ","));
+                }
+                writer.Line();
+            }
+
+            foreach (var type in referenced.Where(x => x.Fields.Count > 0).OrderBy(x => x.QualifiedName, StringComparer.Ordinal))
+            {
+                EmitLogicalDto(writer, type);
+                if (CanGenerateRawDto(type, new HashSet<string>()))
+                    EmitRawDto(writer, type);
+            }
         }
-        foreach (var type in referenced.Where(x => x.Fields.Count > 0).OrderBy(x => x.QualifiedName, StringComparer.Ordinal))
+        return writer.ToString();
+    }
+
+    private void EmitLogicalDto(CodeWriter writer, PlcType type)
+    {
+        using (writer.Block("public sealed class " + TypeIdentifier(type) + "Dto"))
         {
-            var reliable = IsReliable(type, new HashSet<string>());
-            if (reliable)
-                sb.Append("    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit, Size = ")
-                  .Append((type.BitSize ?? 0) / 8).Append(")]\n    public struct ");
-            else sb.Append("    public sealed class ");
-            sb.Append(TypeIdentifier(type)).Append("Dto\n    {\n");
             var names = UniqueMemberNames(type.Fields.Select(x => x.Name).ToList());
             for (var i = 0; i < type.Fields.Count; i++)
             {
                 var field = type.Fields[i];
-                if (reliable)
-                {
-                    sb.Append("        [System.Runtime.InteropServices.FieldOffset(").Append((field.BitOffset ?? 0) / 8).Append(")]\n");
-                    if (string.Equals(field.Type.Name, "BOOL", StringComparison.OrdinalIgnoreCase))
-                        sb.Append("        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.I1)]\n");
-                    sb.Append("        public ").Append(CsType(field.Type)).Append(' ').Append(names[i]).Append(";\n\n");
-                }
-                else sb.Append("        public ").Append(CsTypeForLogical(field.Type, field.Dimensions)).Append(' ').Append(names[i]).Append(" { get; set; }\n\n");
+                writer.Line("public " + CsLogicalTypeForLogical(field.Type, field.Dimensions) + " " + names[i] + " { get; set; }");
+                writer.Line();
             }
-            sb.Append("    }\n\n");
         }
-        sb.Append("}\n");
-        return sb.ToString();
+        writer.Line();
+    }
+
+    private void EmitRawDto(CodeWriter writer, PlcType type)
+    {
+        writer.Line("[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit, Size = " + ((type.BitSize ?? 0) / 8) + ")]");
+        using (writer.Block("public struct " + TypeIdentifier(type) + "RawDto"))
+        {
+            var names = UniqueMemberNames(type.Fields.Select(x => x.Name).ToList());
+            for (var i = 0; i < type.Fields.Count; i++)
+            {
+                var field = type.Fields[i];
+                writer.Line("[System.Runtime.InteropServices.FieldOffset(" + ((field.BitOffset ?? 0) / 8) + ")]");
+                if (string.Equals(field.Type.Name, "BOOL", StringComparison.OrdinalIgnoreCase))
+                    writer.Line("[System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.I1)]");
+                writer.Line("public " + CsRawType(field.Type) + " " + names[i] + ";");
+                writer.Line();
+            }
+        }
+        writer.Line();
     }
 
     private string EmitManifest()
     {
         var hash = ContractGenerator.Sha256(Items);
-        var sb = Header();
-        sb.Append("namespace ").Append(_config.Namespace).Append("\n{\n")
-          .Append("    internal static class ").Append(_rootClass).Append("Manifest\n    {\n")
-          .Append("        internal static readonly ETS.PlcVariables.Contracts.PlcContractManifest Value = new ETS.PlcVariables.Contracts.PlcContractManifest\n        {\n")
-          .Append("            TmcName = \"").Append(Escape(_tmcName)).Append("\",\n")
-          .Append("            ContractHash = \"").Append(hash).Append("\",\n")
-          .Append("            Symbols = new ETS.PlcVariables.Contracts.PlcContractSymbol[]\n            {\n");
-        foreach (var item in Items)
+        var writer = Header();
+        using (writer.Block("namespace " + _config.Namespace))
         {
-            sb.Append("                new ETS.PlcVariables.Contracts.PlcContractSymbol { Path = \"").Append(Escape(item.Path))
-              .Append("\", PlcTypeName = \"").Append(Escape(item.PlcTypeName)).Append("\", CSharpTypeName = \"")
-              .Append(Escape(item.CSharpTypeName)).Append("\", Size = ").Append(item.Size?.ToString(CultureInfo.InvariantCulture) ?? "null")
-              .Append(", Kind = \"").Append(item.Kind.ToString().ToLowerInvariant()).Append("\", Comment = ")
-              .Append(item.Comment == null ? "null" : "\"" + Escape(item.Comment) + "\"")
-              .Append(", BinaryLayoutReliable = ").Append(item.BinaryLayoutReliable ? "true" : "false")
-              .Append(", Dimensions = new ETS.PlcVariables.Contracts.PlcArrayDimension[] { ");
-            foreach (var dim in item.Dimensions)
-                sb.Append("new ETS.PlcVariables.Contracts.PlcArrayDimension { LowerBound = ").Append(dim.LowerBound).Append(", UpperBound = ").Append(dim.UpperBound).Append(" }, ");
-            sb.Append("} },\n");
+            using (writer.Block("internal static class " + _rootClass + "Manifest"))
+            {
+                writer.Line("internal static readonly ETS.PlcVariables.Contracts.PlcContractManifest Value = new ETS.PlcVariables.Contracts.PlcContractManifest");
+                writer.Line("{");
+                writer.Line("    TmcName = \"" + Escape(_tmcName) + "\",");
+                writer.Line("    ContractHash = \"" + hash + "\",");
+                writer.Line("    Symbols = new ETS.PlcVariables.Contracts.PlcContractSymbol[]");
+                writer.Line("    {");
+                foreach (var item in Items)
+                {
+                    writer.Line("        new ETS.PlcVariables.Contracts.PlcContractSymbol { Path = \"" + Escape(item.Path)
+                        + "\", PlcTypeName = \"" + Escape(item.PlcTypeName)
+                        + "\", CSharpTypeName = \"" + Escape(item.CSharpTypeName)
+                        + "\", Size = " + (item.Size?.ToString(CultureInfo.InvariantCulture) ?? "null")
+                        + ", Kind = \"" + item.Kind.ToString().ToLowerInvariant()
+                        + "\", Comment = " + (item.Comment == null ? "null" : "\"" + Escape(item.Comment) + "\"")
+                        + ", BinaryLayoutReliable = " + (item.BinaryLayoutReliable ? "true" : "false")
+                        + ", Dimensions = new ETS.PlcVariables.Contracts.PlcArrayDimension[] { " + DimensionsInitializer(item.Dimensions) + " } },");
+                }
+                writer.Line("    }");
+                writer.Line("};");
+            }
         }
-        sb.Append("            }\n        };\n    }\n}\n");
-        return sb.ToString();
+        return writer.ToString();
     }
 
     private List<PlcType> ReachableTypes(IEnumerable<TypeReference> references)
@@ -274,27 +402,47 @@ internal sealed class CSharpEmitter
         return result.Values.ToList();
     }
 
-    private bool IsReliable(PlcType type, HashSet<string> stack)
+    private List<PlcType> ReachablePointerStructTypes(IEnumerable<TypeReference> references)
+    {
+        var result = new Dictionary<string, PlcType>(StringComparer.OrdinalIgnoreCase);
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Visit(TypeReference reference)
+        {
+            var type = _model.Resolve(reference);
+            if (reference.PointerLevel > 0 && type?.Fields.Count > 0)
+                result.TryAdd(type.QualifiedName, type);
+            if (type == null || !visited.Add(type.QualifiedName)) return;
+            foreach (var field in type.Fields) Visit(field.Type);
+        }
+        foreach (var reference in references) Visit(reference);
+        return result.Values.ToList();
+    }
+
+    private bool CanGenerateRawDto(PlcType type, HashSet<string> stack)
     {
         if (_layout.TryGetValue(type.QualifiedName, out var cached)) return cached;
-        if (!stack.Add(type.QualifiedName) || !type.BitSize.HasValue || type.BitSize.Value % 8 != 0 || type.Fields.Count == 0)
+        if (type.IsSyntheticNamespace || !stack.Add(type.QualifiedName) || !type.BitSize.HasValue || type.BitSize.Value % 8 != 0 || type.Fields.Count == 0)
             return _layout[type.QualifiedName] = false;
+
         foreach (var field in type.Fields)
         {
             if (field.Type.PointerLevel > 0 || field.Dimensions.Count > 0 || !field.BitOffset.HasValue || field.BitOffset.Value % 8 != 0 || !field.BitSize.HasValue || field.BitSize.Value % 8 != 0)
                 return _layout[type.QualifiedName] = false;
             var nested = _model.Resolve(field.Type);
-            if (nested != null && nested.EnumValues.Count == 0 && !IsReliable(nested, stack)) return _layout[type.QualifiedName] = false;
-            if (nested == null && (!PrimitiveTypes.ContainsKey(BaseName(field.Type.Name)) || IsString(field.Type.Name))) return _layout[type.QualifiedName] = false;
+            if (nested != null && nested.EnumValues.Count == 0 && !CanGenerateRawDto(nested, stack))
+                return _layout[type.QualifiedName] = false;
+            if (nested == null && (!PrimitiveTypes.ContainsKey(BaseName(field.Type.Name)) || IsString(field.Type.Name)))
+                return _layout[type.QualifiedName] = false;
         }
+
         stack.Remove(type.QualifiedName);
         return _layout[type.QualifiedName] = true;
     }
 
     private PlcTypeKind Kind(TypeReference reference, PlcType? type, List<PlcArrayDimension> dimensions)
     {
+        if (reference.PointerLevel > 0 && dimensions.Count == 0) return PlcTypeKind.Pointer;
         if (dimensions.Count > 0) return PlcTypeKind.Array;
-        if (reference.PointerLevel > 0) return Unknown(reference);
         if (type?.IsSyntheticNamespace == true) return PlcTypeKind.Namespace;
         if (IsString(reference.Name) || (type != null && IsString(type.BaseType.Name))) return PlcTypeKind.String;
         if (type?.EnumValues.Count > 0) return PlcTypeKind.Enum;
@@ -306,43 +454,77 @@ internal sealed class CSharpEmitter
 
     private PlcTypeKind Unknown(TypeReference reference)
     {
-        if (_unknown.Add(reference.QualifiedName)) Warnings.Add("Unknown PLC type '" + reference.QualifiedName + "'. Symbols use object wrappers and have no binary layout.");
+        if (_unknown.Add(reference.QualifiedName))
+            Warnings.Add("Unknown PLC type '" + reference.QualifiedName + "'. Symbols use object wrappers and have no binary layout.");
         return PlcTypeKind.Unknown;
+    }
+
+    private void UnsupportedPointer(TypeReference reference)
+    {
+        if (_unsupportedPointers.Add(reference.QualifiedName))
+            Warnings.Add("Unsupported pointer target PLC type '" + reference.QualifiedName + "'. Pointer symbols use object wrappers and have no binary layout.");
+    }
+
+    private bool IsSupportedPointerTarget(TypeReference reference, PlcType? type)
+    {
+        if (type?.Fields.Count > 0 || type?.EnumValues.Count > 0) return true;
+        return IsString(reference.Name) || PrimitiveTypes.ContainsKey(BaseName(reference.Name));
     }
 
     private string WrapperType(TypeReference reference, List<PlcArrayDimension> dimensions)
     {
         var type = _model.Resolve(reference);
-        if (dimensions.Count > 0) return "PlcArraySymbol<" + CsType(reference) + ">";
+        if (reference.PointerLevel > 0 && dimensions.Count == 0)
+        {
+            if (type?.Fields.Count > 0) return TypeIdentifier(type) + "PointerNode";
+            var pointerKind = Kind(new TypeReference { Name = reference.Name, Namespace = reference.Namespace, Guid = reference.Guid }, type, dimensions);
+            if (_config.GenerateSubscriptions && (pointerKind == PlcTypeKind.Primitive || pointerKind == PlcTypeKind.Enum))
+                return "PlcSubscribableSymbol<" + CsLogicalType(reference) + ">";
+            return "PlcSymbol<" + CsLogicalType(reference) + ">";
+        }
+        if (dimensions.Count > 0) return "PlcArraySymbol<" + CsLogicalType(reference) + ">";
         if (type?.Fields.Count > 0) return TypeIdentifier(type) + "Node";
         var kind = Kind(reference, type, dimensions);
         if (_config.GenerateSubscriptions && (kind == PlcTypeKind.Primitive || kind == PlcTypeKind.Enum))
-            return "PlcSubscribableSymbol<" + CsType(reference) + ">";
-        return "PlcSymbol<" + CsType(reference) + ">";
+            return "PlcSubscribableSymbol<" + CsLogicalType(reference) + ">";
+        return "PlcSymbol<" + CsLogicalType(reference) + ">";
     }
 
-    private string CsType(TypeReference reference)
+    private string CsLogicalType(TypeReference reference)
     {
-        if (reference.PointerLevel > 0) return "object";
         if (IsString(reference.Name)) return "string";
         if (PrimitiveTypes.TryGetValue(BaseName(reference.Name), out var primitive)) return primitive;
         var type = _model.Resolve(reference);
         if (type?.EnumValues.Count > 0) return TypeIdentifier(type);
         if (type?.Fields.Count > 0) return TypeIdentifier(type) + "Dto";
-        if (type != null && !string.IsNullOrEmpty(type.BaseType.Name)) return CsType(type.BaseType);
+        if (type != null && !string.IsNullOrEmpty(type.BaseType.Name)) return CsLogicalType(type.BaseType);
         return "object";
     }
 
-    private string CsTypeForLogical(TypeReference reference, List<PlcArrayDimension> dimensions) => CsType(reference) + (dimensions.Count == 0 ? string.Empty : "[]");
+    private string CsRawType(TypeReference reference)
+    {
+        if (PrimitiveTypes.TryGetValue(BaseName(reference.Name), out var primitive)) return primitive;
+        var type = _model.Resolve(reference);
+        if (type?.EnumValues.Count > 0) return TypeIdentifier(type);
+        if (type?.Fields.Count > 0) return TypeIdentifier(type) + "RawDto";
+        if (type != null && !string.IsNullOrEmpty(type.BaseType.Name)) return CsRawType(type.BaseType);
+        return "object";
+    }
+
+    private string CsLogicalTypeForLogical(TypeReference reference, List<PlcArrayDimension> dimensions)
+    {
+        return CsLogicalType(reference) + (dimensions.Count == 0 ? string.Empty : "[]");
+    }
+
     private string PlcName(TypeReference reference) => string.IsNullOrEmpty(reference.QualifiedName) ? "UNKNOWN" : reference.QualifiedName;
     private static bool IsString(string name) => BaseName(name).StartsWith("STRING", StringComparison.OrdinalIgnoreCase) || BaseName(name).StartsWith("WSTRING", StringComparison.OrdinalIgnoreCase);
-    private static string BaseName(string name) => Regex.Replace(name.Trim(), "\\s*\\(.*\\)$", string.Empty).ToUpperInvariant();
+    private static string BaseName(string name) => Regex.Replace((name ?? string.Empty).Trim(), "\\s*\\(.*\\)$", string.Empty).ToUpperInvariant();
     private string EnumBase(PlcType type) => PrimitiveTypes.TryGetValue(BaseName(type.BaseType.Name), out var value) && value != "bool" ? value : "int";
 
     private string TypeIdentifier(PlcType type)
     {
         var duplicate = _model.TypesByName.Values.Distinct().Count(x => string.Equals(x.Name, type.Name, StringComparison.OrdinalIgnoreCase)) > 1;
-        return Identifier((duplicate ? type.QualifiedName.Replace('.', '_') : type.Name));
+        return Identifier(duplicate ? type.QualifiedName.Replace('.', '_') : type.Name);
     }
 
     private static List<string> UniqueNames(List<string> source)
@@ -383,28 +565,48 @@ internal sealed class CSharpEmitter
         return joined;
     }
 
+    private CodeWriter Header()
+    {
+        var writer = new CodeWriter();
+        writer.Line("// <auto-generated />");
+        writer.Line("// Generated from: " + _tmcName);
+        writer.Line("// Do not edit manually.");
+        writer.Line();
+        return writer;
+    }
+
+    private static string SymbolAccessPath(string path, TypeReference reference)
+    {
+        return reference.PointerLevel > 0 ? path + "^" : path;
+    }
+
+    private static string FieldAccessSuffix(PlcField field)
+    {
+        return "." + field.Name + (field.Type.PointerLevel > 0 && field.Dimensions.Count == 0 ? "^" : string.Empty);
+    }
+
+    private static string DimensionsArgument(List<PlcArrayDimension> dimensions)
+    {
+        if (dimensions.Count == 0) return string.Empty;
+        return ", new int[] { " + string.Join(", ", dimensions.Select(x => x.LowerBound)) + " }, new int[] { "
+            + string.Join(", ", dimensions.Select(x => x.UpperBound)) + " }";
+    }
+
+    private static string DimensionsInitializer(List<PlcArrayDimension> dimensions)
+    {
+        return string.Concat(dimensions.Select(dim => "new ETS.PlcVariables.Contracts.PlcArrayDimension { LowerBound = "
+            + dim.LowerBound + ", UpperBound = " + dim.UpperBound + " }, "));
+    }
+
     private static string Pascal(string word) => word.Length == 0 ? word : char.ToUpperInvariant(word[0]) + word[1..].ToLowerInvariant();
     private static string ShortHash(string value) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(value))).Substring(0, 8);
-    private static readonly HashSet<string> Keywords = new(new[] { "class", "struct", "enum", "event", "namespace", "public", "private", "internal", "void", "string", "object", "base", "this", "new", "return", "params", "ref", "out", "in", "is", "as", "operator", "implicit", "explicit", "interface", "delegate", "readonly", "sealed", "partial", "static", "bool", "byte", "short", "int", "long", "float", "double" }, StringComparer.Ordinal);
-
-    private StringBuilder HeaderInstance()
-    {
-        var sb = new StringBuilder();
-        sb.Append("// <auto-generated />\n// Generated from: ").Append(_tmcName).Append("\n// Do not edit manually.\n\n");
-        return sb;
-    }
-
-    private StringBuilder Header()
-    {
-        return HeaderInstance();
-    }
-
-    private static void AppendDimensions(StringBuilder sb, List<PlcArrayDimension> dimensions)
-    {
-        if (dimensions.Count == 0) return;
-        sb.Append(", new int[] { ").Append(string.Join(", ", dimensions.Select(x => x.LowerBound))).Append(" }, new int[] { ")
-          .Append(string.Join(", ", dimensions.Select(x => x.UpperBound))).Append(" }");
-    }
-
     private static string Escape(string value) => value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n");
+
+    private static readonly HashSet<string> Keywords = new(new[]
+    {
+        "class", "struct", "enum", "event", "namespace", "public", "private", "internal", "void",
+        "string", "object", "base", "this", "new", "return", "params", "ref", "out", "in",
+        "is", "as", "operator", "implicit", "explicit", "interface", "delegate", "readonly",
+        "sealed", "partial", "static", "bool", "byte", "short", "int", "long", "float", "double"
+    }, StringComparer.Ordinal);
 }

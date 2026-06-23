@@ -33,17 +33,26 @@ public sealed class GeneratorTests
         StringAssert.Contains(wrappers, "public PlcRoot_MachinePlc(ETS.TwinCAT.Ads.PlcConnection connection)");
         StringAssert.Contains(wrappers, "public PlcSubscribableSymbol<bool> IsReady");
         StringAssert.Contains(wrappers, "PlcSubscribableSymbol<T> : PlcSymbol<T>, ETS.PlcVariables.IPlcSubscribableSymbol<T>");
-        StringAssert.Contains(wrappers, "StStateNode : ETS.PlcVariables.IPlcSubscribableSymbol<StStateDto>");
+        StringAssert.Contains(wrappers, "StStateNode : ETS.PlcVariables.IPlcSubscribableSymbol<StStateRawDto>");
         Assert.IsFalse(wrappers.Contains("StHmiNode : ETS.PlcVariables.IPlcSubscribableSymbol<StHmiDto>"));
         StringAssert.Contains(wrappers, "public PlcSymbol<string> Title");
         StringAssert.Contains(wrappers, "public PlcArraySymbol<string> Names");
+        StringAssert.Contains(wrappers, "_path + \".Pointer^\"");
         StringAssert.Contains(wrappers, "new int[] { 1, -1 }, new int[] { 2, 0 }");
+        StringAssert.Contains(dto, "public sealed class StStateDto");
+        StringAssert.Contains(dto, "public bool IsReady { get; set; }");
+        StringAssert.Contains(dto, "public struct StStateRawDto");
         StringAssert.Contains(dto, "LayoutKind.Explicit");
         StringAssert.Contains(dto, "public sealed class StHmiDto");
+        Assert.IsFalse(dto.Contains("public struct StHmiRawDto"));
         StringAssert.Contains(dto, "Class = 1");
         StringAssert.Contains(manifest, "BinaryLayoutReliable = false");
+        StringAssert.Contains(manifest, "Path = \"GVL_HMI.HMI.Pointer\"");
+        StringAssert.Contains(manifest, "Kind = \"pointer\"");
 
-        StringAssert.Contains(wrappers, "PlcSubscription<StStateDto> Subscribe");
+        StringAssert.Contains(wrappers, "StStateRawDto ReadRaw()");
+        StringAssert.Contains(wrappers, "void WriteRaw(StStateRawDto value)");
+        StringAssert.Contains(wrappers, "PlcSubscription<StStateRawDto> Subscribe");
         Assert.IsFalse(wrappers.Contains("PlcSubscription<StHmiDto>"));
     }
 
@@ -103,6 +112,72 @@ public sealed class GeneratorTests
         config.UnknownTypeIsError = true;
         File.WriteAllText(configPath, JsonSerializer.Serialize(config));
         StringAssert.Contains(Assert.ThrowsException<GeneratorException>(() => ContractGenerator.Generate(configPath)).Message, "Unknown PLC type");
+    }
+
+    [TestMethod]
+    public void UnsupportedPointerTargetCanBePromotedToError()
+    {
+        var tmc = Path.Combine(_directory, "MachinePlc.tmc");
+        File.WriteAllText(tmc, File.ReadAllText(tmc).Replace("<t:Type PointerTo=\"1\">BOOL</t:Type>", "<t:Type PointerTo=\"1\">MYSTERY</t:Type>"));
+        var configPath = WriteConfig(new[] { "GVL_HMI.HMI" });
+        var config = JsonSerializer.Deserialize<GeneratorConfig>(File.ReadAllText(configPath))!;
+        config.UnknownTypeIsError = true;
+        File.WriteAllText(configPath, JsonSerializer.Serialize(config));
+        StringAssert.Contains(Assert.ThrowsException<GeneratorException>(() => ContractGenerator.Generate(configPath)).Message, "Unsupported pointer target PLC type");
+    }
+
+    [TestMethod]
+    public void PointerToStructUsesDereferencedChildPaths()
+    {
+        var tmc = Path.Combine(_directory, "MachinePlc.tmc");
+        File.WriteAllText(tmc, File.ReadAllText(tmc)
+            .Replace("<t:Type PointerTo=\"1\">BOOL</t:Type>", "<t:Type PointerTo=\"1\" GUID=\"{STATE}\">ST_State</t:Type>"));
+        ContractGenerator.Generate(WriteConfig(new[] { "GVL_HMI.HMI" }));
+        var wrappers = Read("Generated/PlcRoot_MachinePlc.g.cs");
+        var manifest = Read("Generated/PlcRoot_MachinePlc.Manifest.g.cs");
+
+        StringAssert.Contains(wrappers, "Pointer = new StStatePointerNode(_variables, _connection, _path + \".Pointer^\");");
+        StringAssert.Contains(wrappers, "public sealed class StStatePointerNode");
+        Assert.IsFalse(wrappers.Contains("StStatePointerNode : ETS.PlcVariables.IPlcSubscribableSymbol"));
+        StringAssert.Contains(manifest, "Path = \"GVL_HMI.HMI.Pointer\"");
+        StringAssert.Contains(manifest, "Kind = \"pointer\"");
+        StringAssert.Contains(manifest, "Path = \"GVL_HMI.HMI.Pointer^.is-ready\"");
+    }
+
+    [TestMethod]
+    public void InvalidConfigFailsBeforeGeneration()
+    {
+        var configPath = WriteConfig(new[] { "GVL_HMI.HMI" });
+        var config = JsonSerializer.Deserialize<GeneratorConfig>(File.ReadAllText(configPath))!;
+
+        config.Namespace = "Bad..Namespace";
+        File.WriteAllText(configPath, JsonSerializer.Serialize(config));
+        StringAssert.Contains(Assert.ThrowsException<GeneratorException>(() => ContractGenerator.Generate(configPath)).Message, "invalid namespace");
+
+        config.Namespace = "Example.Generated";
+        config.Roots = new[] { "GVL_HMI.HMI", " GVL_HMI.HMI " };
+        File.WriteAllText(configPath, JsonSerializer.Serialize(config));
+        StringAssert.Contains(Assert.ThrowsException<GeneratorException>(() => ContractGenerator.Generate(configPath)).Message, "duplicate root");
+
+        config.Roots = new[] { " " };
+        File.WriteAllText(configPath, JsonSerializer.Serialize(config));
+        StringAssert.Contains(Assert.ThrowsException<GeneratorException>(() => ContractGenerator.Generate(configPath)).Message, "empty root");
+
+        config.Roots = new[] { "GVL_HMI.HMI" };
+        config.Output = ".";
+        File.WriteAllText(configPath, JsonSerializer.Serialize(config));
+        StringAssert.Contains(Assert.ThrowsException<GeneratorException>(() => ContractGenerator.Generate(configPath)).Message, "output cannot be the config directory");
+    }
+
+    [TestMethod]
+    public void CodeWriterWritesIndentedLfBlocks()
+    {
+        var writer = new CodeWriter();
+        using (writer.Block("class A"))
+        {
+            writer.Line("void M();");
+        }
+        Assert.AreEqual("class A\n{\n    void M();\n}\n", writer.ToString());
     }
 
     [TestMethod]

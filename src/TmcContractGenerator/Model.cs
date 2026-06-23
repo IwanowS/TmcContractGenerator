@@ -47,7 +47,7 @@ public sealed class GeneratorException : Exception
     public GeneratorException(string message, Exception inner) : base(message, inner) { }
 }
 
-internal enum PlcTypeKind { Primitive, Enum, Struct, Array, String, Namespace, Unknown }
+internal enum PlcTypeKind { Primitive, Enum, Struct, Array, String, Namespace, Pointer, Unknown }
 
 internal sealed class PlcArrayDimension
 {
